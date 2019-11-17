@@ -4,12 +4,12 @@ from collections import defaultdict
 import datetime
 from forex_python import converter
 from functools import lru_cache
+from lxml import etree, html
 import random
-from tempfile import NamedTemporaryFile
-from time import sleep
 import regex
 import requests
-from lxml import etree, html
+from tempfile import NamedTemporaryFile
+from time import sleep
 
 # employer size
 ES_ANY = 0
@@ -28,7 +28,7 @@ class Throttler:
     # it uses an exponential distribution (which models the duration between poisson events)
     # and a minimum delay (to loosely model how quickly a human would be able to click a link)
     # all durations are in seconds
-    def __init__(self, average_rate=1.5, minimum_delay=0.673):
+    def __init__(self, average_rate=3, minimum_delay=0.673):
         # a lower average rate sometimes gave me bot warnings
         self.next_allowed_run = datetime.datetime.utcnow()
         self.average_rate = average_rate
@@ -39,7 +39,8 @@ class Throttler:
 
     def throttle(self, func):
         if self.next_allowed_run > datetime.datetime.utcnow():
-            sleep((self.next_allowed_run - datetime.datetime.utcnow()).total_seconds())
+            to_sleep = (self.next_allowed_run - datetime.datetime.utcnow()).total_seconds()
+            sleep(max(to_sleep, 0))
         self.next_allowed_run = datetime.datetime.utcnow() + datetime.timedelta(seconds=self._generate_next_delay())
         return func()
 
@@ -156,7 +157,7 @@ class BaseSearch:
             'connection': 'keep-alive',
             'host': 'www.glassdoor.com',
             'upgrade-insecure-requests': '1',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/71.0.3578.98 Safari/537.36',
+            'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2227.1 Safari/537.36',
         }
 
     def get_home_page(self):
@@ -187,8 +188,8 @@ class BaseSearch:
                     raise
                 continue
 
-    @staticmethod
-    def check_page_for_errors(response):
+    @classmethod
+    def check_page_for_errors(cls, response):
         # checks if the page is an error page, parses the error message, and re-raises Terminal or Transient
         is_potential_bot_match = regex.search(r'isPotentialBot":(true|false)', response.text)
         is_potential_bot = is_potential_bot_match and is_potential_bot_match.groups()[0] == "true"
@@ -196,7 +197,9 @@ class BaseSearch:
                                                 r'someone sharing your internet network.', response.text))
         gateway_timeout = regex.search(r'The web server reported a gateway time-out error.', response.text)
         bad_gateway = regex.search(r'The web server reported a bad gateway error.', response.text)
+        no_matches = regex.search(r'Your filtered search does not match any jobs. Try to broaden your search by changing the filters above.', response.text)
         volume_timeout = regex.search(r'your search timed out due to high volumes', response.text)
+        promised_jobs = cls.parse_promised_jobs(html.fromstring(response.text))  # TODO filthy
         if is_potential_bot or suspicious_activity:
             raise TerminalScrapeError("Glassdoor suspects us of being a bot while getting %s (is_potential_bot: %s, 'suspicious activity': %s)!" % (response.url, is_potential_bot, suspicious_activity))
         elif gateway_timeout:
@@ -207,6 +210,8 @@ class BaseSearch:
             # I'm not actually sure if this means our request volume, or general request volume across the site
             # regardless, a retry usually makes this go away
             raise TransientScrapeError("Volume timeout")
+        elif no_matches and promised_jobs:
+            raise TransientScrapeError("No jobs when there should be")
         else:
             return True
 
@@ -259,6 +264,8 @@ class SingleSearch(BaseSearch):
         self.session.headers['Referer'] = response.url
         parser = html.fromstring(response.text)
         promised_jobs = self.parse_promised_jobs(parser)
+        if not promised_jobs:
+            self.fail_dumping_response("Got an unknown page with no promised jobs", response)
         if promised_jobs > 900 and self.industry_code == -1:
             # Glassdoor caps searches to 30 pages, which is around 900 jobs (most pages contain 30 jobs)
             # We use a workaround: we split up the search into multiple searches, one per industry code
@@ -282,6 +289,8 @@ class SingleSearch(BaseSearch):
             base_url = "https://www.glassdoor.com"
             parser.make_links_absolute(base_url)
             new_promised_jobs = self.parse_promised_jobs(parser)
+            if not new_promised_jobs:
+                self.fail_dumping_response("Got an unknown page with no promised jobs", response)
 
             this_page_listings = self.listings_from_page(parser, response.url)
             result += this_page_listings
@@ -418,12 +427,24 @@ class SingleSearch(BaseSearch):
                 "requested_location": self.location_string,
                 "city": city,
                 "state": state,
-                "rating": self.extract(job, './/span[@class="compactStars "]/text()', float),
                 "url": listing_url,
                 "listing_id": self.parse_listing_id(listing_url),
             }
+            if listing['company'] is None:
+                # glassdoor seems to be trialling a new format for some percentage of its user base
+                listing['company'] = self.extract(job, './/div[contains(@class, "jobEmpolyerName")]/text()')
             details_page_parser = self.get_details_page(listing_url)
-            salary_range = self.parse_salary(job) or self.get_salary_the_hard_way(listing["title"], details_page_parser)
+            try:
+                salary_range = self.parse_salary(job) or self.get_salary_the_hard_way(listing["title"], details_page_parser)
+            except Exception as i:
+                e = Exception()
+                e.parser = parser
+                e.url = url
+                e.old = i
+                raise e
+            rating = self.extract(job, './/span[@class="compactStars "]/text()', float)
+            if rating is not None:
+                listing['rating'] = rating
             if salary_range:
                 if isinstance(salary_range[0], (tuple, list)) or isinstance(salary_range[1], (tuple, list)):
                     raise Exception(salary_range)
@@ -464,11 +485,17 @@ class SingleSearch(BaseSearch):
         salaries = parser.xpath('//div[contains(@class, "salaryList")]//div[contains(@class, "SalaryRowStyle__row")]')
         sals = []
         for salary_parser in salaries:
-            salary_job_title = salary_parser.xpath('.//div[contains(@class,"JobInfoStyle__jobTitle")]/a/text()')[0]
+            try:
+                salary_job_title = salary_parser.xpath('.//div[contains(@class,"JobInfoStyle__jobTitle")]/a/text()')[0]
+            except IndexError:
+                salary_job_title = salary_parser.xpath('.//div[contains(@class,"JobInfoStyle__jobTitle")]/span/text()')[0]
             # TODO use this to estimate confidence
             sample_size = int(salary_parser.xpath('.//div[contains(@class,"JobInfoStyle__jobCount")]/text()')[0])
             salary_range = tuple(map(self.parse_salary_definition,
                                      salary_parser.xpath('.//div[contains(@class,"RangeBarStyle__values")]/span/text()')))
+            if not salary_range:
+                # this happens because glassdoor only displays the top three matching salaries for un-signed-in users
+                continue
             sals.append((salary_job_title, sample_size, salary_range))
             if salary_job_title == job_title:
                 return salary_range
