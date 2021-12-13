@@ -14,7 +14,7 @@ Keras==2.2.4
 Keras-Applications==1.0.6
 Keras-Preprocessing==1.0.5
 langdetect==1.0.7
-lxml==4.3.1
+lxml==4.6.5
 Markdown==2.6.10
 mock==2.0.0
 mox==0.5.3
